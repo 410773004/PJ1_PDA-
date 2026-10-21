@@ -38,8 +38,8 @@ def next_pow2(x: int) -> int:
 @dataclasses.dataclass
 class NandGeometry:
     channels: int = 8   # CH
-    ce: int = 2          # nr_targets (CE)
-    lun: int = 2          # nr_luns
+    ce: int = 1          # nr_targets (CE)
+    lun: int = 1          # nr_luns
     planes: int = 4          # nr_planes
     pages: int = 1344       # nr_pages / block
     blocks: int = 831        # nr_blocks / lun
@@ -99,8 +99,42 @@ def page_type(page: int) -> str:
     return ("Lower", "Middle", "Upper")[page % 3]
 
 
+def die_to_chcelun(geo: NandGeometry, die: int) -> tuple:
+    """die 編號拆回 (ch, ce, lun)：die 的排列是 ch 在低位、接著 ce、最後 lun，
+    跟 PDA 裡 ch_shift < ce_shift < lun_shift 的順序一致 (pda2die 就是從 ch_shift 開始取)"""
+    lun_num = geo.channels * geo.ce * geo.lun
+    if not 0 <= die < lun_num:
+        raise ValueError(f"die={die} 超出範圍 (0~{lun_num - 1})")
+    ch_bits = ctz(geo.channels)
+    ce_bits = ctz(geo.ce)
+    ch = die & (geo.channels - 1)
+    ce = (die >> ch_bits) & (geo.ce - 1)
+    lun = die >> (ch_bits + ce_bits)
+    return ch, ce, lun
+
+
+def chcelun_to_die(geo: NandGeometry, ch: int, ce: int, lun: int) -> int:
+    """(ch, ce, lun) 合併成 die 編號，是 die_to_chcelun 的反向"""
+    ch_bits = ctz(geo.channels)
+    ce_bits = ctz(geo.ce)
+    return ch | (ce << ch_bits) | (lun << (ch_bits + ce_bits))
+
+
+def check_fields(geo: NandGeometry, ch: int, ce: int, lun: int, plane: int, block: int, page: int, du: int) -> None:
+    """欄位超出 geometry 時直接報錯，避免超界的值被 OR 進相鄰欄位而算出看似正常的錯誤 PDA"""
+    limits = (
+        ("ch", ch, geo.channels), ("ce", ce, geo.ce), ("lun", lun, geo.lun),
+        ("plane", plane, geo.planes), ("block", block, geo.blocks),
+        ("page", page, geo.pages), ("du", du, 4),
+    )
+    for name, val, upper in limits:
+        if not 0 <= val < upper:
+            raise ValueError(f"{name}={val} 超出範圍 (0~{upper - 1})")
+
+
 def encode_pda(geo: NandGeometry, ch: int, ce: int, lun: int, plane: int, block: int, page: int, du: int = 0) -> int:
     """對應 pda_assemble_xlc()：把各欄位組回 32-bit PDA"""
+    check_fields(geo, ch, ce, lun, plane, block, page, du)
     layout = build_layout(geo)
     return (
         (lun << layout.lun_shift)
@@ -125,7 +159,16 @@ def decode_pda(geo: NandGeometry, pda: int) -> dict:
     page = (pda >> layout.page_shift) & layout.page_mask
     du = (pda >> layout.du_shift) & 3
     physical_block = block * geo.planes + plane  # PB = LB * planes + plane，跟 encode 端的雙向換算公式一致
-    return {
+
+    # 欄位值超出 geometry 代表這個 PDA 不屬於這個 geometry (或 PDA 本身有誤)，附上 warning 提醒
+    warnings = []
+    if page >= geo.pages:
+        warnings.append(f"page {page} >= {geo.pages}")
+    if block >= geo.blocks:
+        warnings.append(f"block {block} >= {geo.blocks}")
+    if pda >> (layout.block_shift + ctz(next_pow2(geo.blocks))):
+        warnings.append("PDA 高位元有多餘的值")
+    result = {
         "pda": f"0x{pda:08x}",
         "ch": ch,
         "ce": ce,
@@ -138,9 +181,12 @@ def decode_pda(geo: NandGeometry, pda: int) -> dict:
         "page_type": page_type(page),
         "du": du,
     }
+    if warnings:
+        result["warning"] = "; ".join(warnings) + " (geometry 可能不符)"
+    return result
 
 
-DEFAULT_GEO = NandGeometry()  # 8CH*2CE*2LUN*4PL, 831blocks*1344pages（LJ2-FG248040 預設值）
+DEFAULT_GEO = NandGeometry()  # 8CH*1CE*1LUN*4PL, 831blocks*1344pages
 
 
 class PdaCalcApp(ttk.Frame):
@@ -150,12 +196,15 @@ class PdaCalcApp(ttk.Frame):
         self._build_geo_section()
         self._build_decode_section()
         self._build_encode_section()
+        # 初始化 PB 與 Die 欄位 (它們是由其他欄位推出來的)
+        self._on_lb_plane_changed()
+        self._on_chcelun_changed()
         self._do_decode()
         self._do_encode()
 
-    # ── NAND geometry（預設抓 LJ2-FG248040，換機種可以自己改）──────────────
+    # ── NAND geometry（預設 8CH*1CE*1LUN*4PL，換機種可以自己改）──────────────
     def _build_geo_section(self):
-        box = ttk.LabelFrame(self, text="NAND geometry（預設值取自 LJ2-FG248040 log：8CH*2CE*2LUN*4PL, 831blocks*1344pages）")
+        box = ttk.LabelFrame(self, text="NAND geometry（預設值：8CH*1CE*1LUN*4PL, 831blocks*1344pages，換機種請自行修改）")
         box.pack(fill="x", pady=(0, 8))
 
         self.geo_vars = {
@@ -177,8 +226,11 @@ class PdaCalcApp(ttk.Frame):
         # geometry 改了會影響 decode/encode 的 shift 換算，所以也要跟著即時重算。
         # decode/encode 區塊此時還沒建立，但 trace 只有在使用者真的改值時才會觸發，
         # 屆時 self._do_decode / self._do_encode 用到的元件早就都存在了。
+        # PB 與 Die 的換算也跟 geometry 有關 (PB = LB*planes + plane；die 的位元寬度取決於 CH/CE 數)，
+        # 所以 geometry 改了也要重算這兩個欄位。
         for var in self.geo_vars.values():
-            var.trace_add("write", lambda *_a: (self._do_decode(), self._do_encode()))
+            var.trace_add("write", lambda *_a: (self._on_lb_plane_changed(), self._on_chcelun_changed(),
+                                                 self._do_decode(), self._do_encode()))
 
     def _current_geo(self) -> NandGeometry:
         try:
@@ -194,7 +246,7 @@ class PdaCalcApp(ttk.Frame):
         row = ttk.Frame(box)
         row.pack(fill="x", padx=4, pady=4)
         ttk.Label(row, text="PDA (0x開頭)：").pack(side="left")
-        self.decode_pda_var = tk.StringVar(value="0x1b10063c")
+        self.decode_pda_var = tk.StringVar(value="0x02dc018c")
         entry = ttk.Entry(row, width=20, textvariable=self.decode_pda_var)
         entry.pack(side="left", padx=(2, 8))
         ttk.Button(row, text="複製結果", command=self._copy_decode_result).pack(side="left", padx=(8, 0))
@@ -236,22 +288,23 @@ class PdaCalcApp(ttk.Frame):
         box.pack(fill="x")
 
         self.encode_vars = {
-            "ch": tk.StringVar(value="3"),
+            "die": tk.StringVar(value="0"),
+            "ch": tk.StringVar(value="0"),
             "ce": tk.StringVar(value="0"),
             "lun": tk.StringVar(value="0"),
             "plane": tk.StringVar(value="3"),
-            "block": tk.StringVar(value="433"),
-            "pb": tk.StringVar(value="1735"),
+            "block": tk.StringVar(value="183"),
+            "pb": tk.StringVar(value="735"),
             "page": tk.StringVar(value="3"),
             "du": tk.StringVar(value="0"),
         }
         labels = {
-            "ch": "CH", "ce": "CE", "lun": "LUN", "plane": "Plane",
+            "die": "Die", "ch": "CH", "ce": "CE", "lun": "LUN", "plane": "Plane",
             "block": "Block(LB)", "pb": "PB", "page": "Page", "du": "DU",
         }
         row = ttk.Frame(box)
         row.pack(fill="x", padx=4, pady=4)
-        for i, key in enumerate(["ch", "ce", "lun", "plane", "block", "pb", "page", "du"]):
+        for i, key in enumerate(["die", "ch", "ce", "lun", "plane", "block", "pb", "page", "du"]):
             ttk.Label(row, text=labels[key]).grid(row=0, column=i * 2, padx=(4, 2), sticky="e")
             if key == "pb":
                 # PB 常常需要一格一格微調著找對應的 LB/Plane，用 Spinbox 給上下箭頭比手動打字方便。
@@ -269,6 +322,7 @@ class PdaCalcApp(ttk.Frame):
         self.encode_result = tk.StringVar(value="")
         result_entry = ttk.Entry(box, textvariable=self.encode_result, font=("Consolas", 11, "bold"), state="readonly")
         result_entry.pack(fill="x", padx=8, pady=(0, 8))
+        self.encode_result_entry = result_entry
 
         # LB/Plane 跟 PB 是同一個東西的兩種表示法（PB = LB*planes + plane），
         # 用 trace 做雙向連動：改 LB 或 Plane 就自動算出 PB，改 PB 就自動反推 LB/Plane。
@@ -277,6 +331,11 @@ class PdaCalcApp(ttk.Frame):
         self.encode_vars["block"].trace_add("write", self._on_lb_plane_changed)
         self.encode_vars["plane"].trace_add("write", self._on_lb_plane_changed)
         self.encode_vars["pb"].trace_add("write", self._on_pb_changed)
+
+        # Die 跟 CH/CE/LUN 也是同一件事的兩種表示法 (die = ch | ce<<.. | lun<<..)，同樣雙向連動、共用同一把鎖。
+        for key in ("ch", "ce", "lun"):
+            self.encode_vars[key].trace_add("write", self._on_chcelun_changed)
+        self.encode_vars["die"].trace_add("write", self._on_die_changed)
 
         # 即時換算：任何欄位一改就自動重算 PDA，不用再按按鈕。
         for key, var in self.encode_vars.items():
@@ -321,12 +380,50 @@ class PdaCalcApp(ttk.Frame):
         finally:
             self._encode_sync_lock = False
 
+    def _on_chcelun_changed(self, *_args):
+        if self._encode_sync_lock:
+            return
+        try:
+            geo = self._current_geo()
+            ch, ce, lun = (int(self.encode_vars[k].get(), 0) for k in ("ch", "ce", "lun"))
+            # 超界的 ch/ce/lun 不能拿來合成 die，否則位元會互相蓋到
+            if not (0 <= ch < geo.channels and 0 <= ce < geo.ce and 0 <= lun < geo.lun):
+                return
+            die = chcelun_to_die(geo, ch, ce, lun)
+        except ValueError:
+            return
+        self._encode_sync_lock = True
+        try:
+            self.encode_vars["die"].set(str(die))
+        finally:
+            self._encode_sync_lock = False
+
+    def _on_die_changed(self, *_args):
+        if self._encode_sync_lock:
+            return
+        try:
+            geo = self._current_geo()
+            ch, ce, lun = die_to_chcelun(geo, int(self.encode_vars["die"].get(), 0))
+        except ValueError:
+            return
+        self._encode_sync_lock = True
+        try:
+            self.encode_vars["ch"].set(str(ch))
+            self.encode_vars["ce"].set(str(ce))
+            self.encode_vars["lun"].set(str(lun))
+        finally:
+            self._encode_sync_lock = False
+
     def _do_encode(self):
         try:
             geo = self._current_geo()
-            v = {k: int(var.get(), 0) for k, var in self.encode_vars.items() if k != "pb"}
+            v = {k: int(var.get(), 0) for k, var in self.encode_vars.items() if k not in ("pb", "die")}
             pda = encode_pda(geo, v["ch"], v["ce"], v["lun"], v["plane"], v["block"], v["page"], v["du"])
-        except ValueError:
+        except ValueError as e:
+            # 欄位超界要讓使用者看得到原因，不能只是靜默不更新 (否則會誤以為還是舊結果)
+            self.encode_result_entry.configure(state="normal")
+            self.encode_result.set(f"錯誤：{e}")
+            self.encode_result_entry.configure(state="readonly")
             return
         self.encode_result.set(f"PDA = 0x{pda:08x}")
 
